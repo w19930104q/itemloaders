@@ -5,6 +5,22 @@
 Release notes
 =============
 
+.. _release-1.6.0:
+
+itemloaders 1.6.0 (unreleased)
+------------------------------
+
+-   Added :class:`AsyncItemLoader`, an asynchronous variant of
+    :class:`ItemLoader` whose processor-running methods are coroutines, so
+    that input, output and ad-hoc processors can be ``async`` functions or
+    callables returning awaitables, freely mixed with regular functions. See
+    :ref:`async-loaders`.
+
+-   Added :class:`itemloaders.processors.AsyncCompose` and
+    :class:`itemloaders.processors.AsyncMapCompose`, asynchronous variants of
+    :class:`itemloaders.processors.Compose` and
+    :class:`itemloaders.processors.MapCompose`.
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)

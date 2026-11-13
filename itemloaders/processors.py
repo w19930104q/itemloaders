@@ -6,6 +6,7 @@ See documentation in :ref:`declaring-loaders`.
 
 from __future__ import annotations
 
+import inspect
 from collections import ChainMap
 from typing import TYPE_CHECKING, Any
 
@@ -14,6 +15,13 @@ from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, MutableMapping
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Return *value*, awaiting it first if it is an awaitable."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 class MapCompose:
@@ -88,6 +96,61 @@ class MapCompose:
         return values
 
 
+class AsyncMapCompose(MapCompose):
+    """
+    Asynchronous variant of :class:`MapCompose`, for use with
+    :class:`~itemloaders.AsyncItemLoader`.
+
+    It works exactly like :class:`MapCompose` — the input value is iterated,
+    each function is applied to every element in order, ``None`` results are
+    filtered out and list results are flattened into the chain — but each
+    function may be a regular function, an asynchronous function or a callable
+    returning an awaitable, and the three kinds can be freely mixed. Awaitable
+    results are awaited in function declaration order and input value order.
+
+    The example below should clarify how it works:
+
+    >>> import asyncio
+    >>> def filter_world(x):
+    ...     return None if x == 'world' else x
+    ...
+    >>> async def to_upper(x):
+    ...     return x.upper()
+    ...
+    >>> from itemloaders.processors import AsyncMapCompose
+    >>> proc = AsyncMapCompose(filter_world, to_upper)
+    >>> asyncio.run(proc(['hello', 'world', 'this']))
+    ['HELLO', 'THIS']
+
+    As with :class:`MapCompose`, functions can receive Loader contexts, and
+    ``__init__`` method keyword arguments are used as default context values.
+    See :class:`Compose` processor for more info.
+    """
+
+    async def __call__(  # type: ignore[override]  # pylint: disable=invalid-overridden-method
+        self, value: Any, loader_context: MutableMapping[str, Any] | None = None
+    ) -> Iterable[Any]:
+        values = arg_to_iter(value)
+        context: MutableMapping[str, Any]
+        if loader_context:
+            context = ChainMap(loader_context, self.default_loader_context)
+        else:
+            context = self.default_loader_context
+        wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
+        for func in wrapped_funcs:
+            next_values: list[Any] = []
+            for v in values:
+                try:
+                    next_values += arg_to_iter(await _maybe_await(func(v)))
+                except Exception as e:
+                    raise ValueError(
+                        f"Error in AsyncMapCompose with "
+                        f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
+                    ) from e
+            values = next_values
+        return values
+
+
 class Compose:
     """
     A processor which is constructed from the composition of the given
@@ -139,6 +202,56 @@ class Compose:
             except Exception as e:
                 raise ValueError(
                     f"Error in Compose with "
+                    f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
+                ) from e
+        return value
+
+
+class AsyncCompose(Compose):
+    """
+    Asynchronous variant of :class:`Compose`, for use with
+    :class:`~itemloaders.AsyncItemLoader`.
+
+    It works exactly like :class:`Compose` — each function receives the output
+    of the previous one, and processing stops on ``None`` unless
+    ``stop_on_none=False`` is passed — but each function may be a regular
+    function, an asynchronous function or a callable returning an awaitable,
+    and the three kinds can be freely mixed. Awaitable results are awaited in
+    function declaration order.
+
+    Example:
+
+    >>> import asyncio
+    >>> async def to_upper(v):
+    ...     return v.upper()
+    ...
+    >>> from itemloaders.processors import AsyncCompose
+    >>> proc = AsyncCompose(lambda v: v[0], to_upper)
+    >>> asyncio.run(proc(['hello', 'world']))
+    'HELLO'
+
+    Each function can optionally receive a ``loader_context`` parameter, and
+    the keyword arguments passed in the ``__init__`` method are used as the
+    default Loader context values, exactly as with :class:`Compose`.
+    """
+
+    async def __call__(  # pylint: disable=invalid-overridden-method
+        self, value: Any, loader_context: MutableMapping[str, Any] | None = None
+    ) -> Any:
+        context: MutableMapping[str, Any]
+        if loader_context:
+            context = ChainMap(loader_context, self.default_loader_context)
+        else:
+            context = self.default_loader_context
+        wrapped_funcs = [wrap_loader_context(f, context) for f in self.functions]
+        for func in wrapped_funcs:
+            if value is None and self.stop_on_none:
+                break
+            try:
+                value = await _maybe_await(func(value))
+            except Exception as e:
+                raise ValueError(
+                    f"Error in AsyncCompose with "
                     f"{func!s} value={value!r} error='{type(e).__name__}: {e!s}'"
                 ) from e
         return value

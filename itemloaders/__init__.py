@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, MutableMapping
     from re import Pattern
 
+    from itemloaders.async_loader import (  # pylint: disable=useless-import-alias
+        AsyncItemLoader as AsyncItemLoader,
+    )
+
 
 class _StatsCollector(Protocol):
     def inc_value(self, key: str, count: int = 1) -> None: ...
@@ -676,3 +680,13 @@ class ItemLoader:
             )
             for jmes in jmess
         )
+
+
+def __getattr__(name: str) -> Any:
+    # Lazy import: itemloaders.async_loader imports ItemLoader from this
+    # module, so importing it here at module level would be circular.
+    if name == "AsyncItemLoader":
+        from itemloaders.async_loader import AsyncItemLoader  # noqa: PLC0415
+
+        return AsyncItemLoader
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
