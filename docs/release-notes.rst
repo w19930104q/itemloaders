@@ -5,6 +5,18 @@
 Release notes
 =============
 
+itemloaders 1.6.0 (unreleased)
+------------------------------
+
+-   Added :ref:`derived-fields`: fields whose value is computed from the final
+    output values of other fields through a callback declared with
+    :class:`DerivedField` in the new :attr:`ItemLoader.derived_fields` class
+    attribute. Derived fields support multi-level and diamond dependencies,
+    inheritance and overriding, nested loaders and loader contexts, are
+    evaluated at most once per load, and reject cycles, unknown dependencies
+    and explicit collection of their names with errors reported before any
+    processor runs.
+
 .. _release-1.5.0:
 
 itemloaders 1.5.0 (2026-09-29)

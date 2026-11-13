@@ -104,6 +104,7 @@ Contents
 .. toctree::
     declaring-loaders
     processors
+    derived-fields
     loaders-context
     nested-loaders
     extending-loaders

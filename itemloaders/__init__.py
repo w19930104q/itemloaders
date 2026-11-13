@@ -7,7 +7,8 @@ See documentation in :ref:`declaring-loaders`.
 from __future__ import annotations
 
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any, Protocol, Self
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, Self, cast
 
 from itemadapter import ItemAdapter
 from parsel import Selector  # noqa: TC002  # for sphinx
@@ -18,8 +19,9 @@ from itemloaders.processors import Identity
 from itemloaders.utils import arg_to_iter
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, MutableMapping
+    from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
     from re import Pattern
+    from typing import ClassVar
 
 
 class _StatsCollector(Protocol):
@@ -35,6 +37,56 @@ def unbound_method(method: Callable[..., Any]) -> Callable[..., Any]:
         if "." not in method.__qualname__:
             return method.__func__  # type: ignore[attr-defined, no-any-return]
     return method
+
+
+@dataclass(frozen=True)
+class DerivedField:
+    """Declaration of a field whose value is computed from other fields.
+
+    :param callback: Callable that receives the final output values of the
+        fields listed in ``depends_on``, as positional arguments and in that
+        order, and returns the raw value of the derived field. The returned
+        value is then passed through the input and output processors declared
+        for the derived field, exactly like a value collected with
+        :meth:`ItemLoader.add_value`. The callback may additionally request the
+        active :ref:`loader context <loaders-context>` through a
+        ``loader_context`` keyword argument.
+    :param depends_on: Names of the fields the callback depends on, in the
+        order in which their final output values are passed to *callback*.
+        A single field name may be given instead of a sequence.
+
+    Derived fields are declared through the ``derived_fields`` class attribute
+    of :class:`ItemLoader`. See :ref:`derived-fields`.
+    """
+
+    callback: Callable[..., Any]
+    depends_on: str | Sequence[str] = ()
+
+    def __post_init__(self) -> None:
+        # Normalize a single field name to a one-element tuple so the
+        # declaration always iterates field names in dependency order.
+        deps = self.depends_on
+        object.__setattr__(
+            self, "depends_on", (deps,) if isinstance(deps, str) else tuple(deps)
+        )
+
+    @property
+    def dependencies(self) -> tuple[str, ...]:
+        """Field names passed to the callback, in order."""
+        return cast("tuple[str, ...]", self.depends_on)
+
+
+def _merge_derived_fields(
+    loader_cls: type[ItemLoader],
+) -> dict[str, DerivedField]:
+    """Merge the :attr:`ItemLoader.derived_fields` mappings of the whole class
+    hierarchy, so subclasses can add declarations and override inherited ones.
+    """
+    declarations: dict[str, DerivedField] = {}
+    # Base classes first, each subclass overriding declarations of the same name.
+    for base in reversed(loader_cls.__mro__):
+        declarations.update(getattr(base, "derived_fields", None) or {})
+    return declarations
 
 
 class ItemLoader:
@@ -119,6 +171,11 @@ class ItemLoader:
     default_input_processor: Callable[..., Any] = Identity()
     default_output_processor: Callable[..., Any] = Identity()
 
+    #: Class-level mapping of derived field names to their
+    #: :class:`DerivedField` declarations. Subclasses inherit the declarations
+    #: of their parents and may add new ones or override inherited ones.
+    derived_fields: ClassVar[Mapping[str, DerivedField]] = {}
+
     def __init__(
         self,
         item: Any = None,
@@ -142,8 +199,15 @@ class ItemLoader:
         self.context: MutableMapping[str, Any] = context
         self.parent: ItemLoader | None = parent
         self._local_values: dict[str, list[Any]] = {}
+        # Merge the class hierarchy once per loader instance. Nested loaders
+        # are created from the same class, so each one caches the same mapping.
+        self._derived_fields_map: Mapping[str, DerivedField] = _merge_derived_fields(
+            self.__class__
+        )
         if has_initial_values:
             for field_name, value in ItemAdapter(item).items():
+                if field_name in self._derived_fields_map:
+                    raise self._derived_collection_error(field_name)
                 self._values.setdefault(field_name, [])
                 self._values[field_name] += arg_to_iter(value)
 
@@ -263,6 +327,10 @@ class ItemLoader:
         return self
 
     def _add_value(self, field_name: str, value: Any) -> None:
+        self._check_not_derived(field_name)
+        self._add_value_checked(field_name, value)
+
+    def _add_value_checked(self, field_name: str, value: Any) -> None:
         value = arg_to_iter(value)
         processed_value = self._process_input_value(field_name, value)
         if processed_value:
@@ -270,8 +338,24 @@ class ItemLoader:
             self._values[field_name] += arg_to_iter(processed_value)
 
     def _replace_value(self, field_name: str, value: Any) -> None:
+        self._check_not_derived(field_name)
         self._values.pop(field_name, None)
-        self._add_value(field_name, value)
+        self._add_value_checked(field_name, value)
+
+    def _check_not_derived(self, field_name: str) -> None:
+        if field_name in self._derived_fields():
+            raise self._derived_collection_error(field_name)
+
+    def _derived_collection_error(self, field_name: str) -> ValueError:
+        return ValueError(
+            f"Field {field_name!r} is a derived field declared in "
+            f"derived_fields, its value is computed and must not be collected "
+            f"explicitly. Remove the add_*/replace_* call or initial item "
+            f"value targeting it, or rename the derived field declaration."
+        )
+
+    def _derived_fields(self) -> Mapping[str, DerivedField]:
+        return self._derived_fields_map
 
     def get_value(
         self,
@@ -322,10 +406,33 @@ class ItemLoader:
         Populate the item with the data collected so far, and return it. The
         data collected is first passed through the :ref:`output processors
         <processors>` to get the final value to assign to each item field.
+
+        Fields declared in :attr:`derived_fields` are computed first, each at
+        most once, from the final output values of their dependencies. Every
+        field output is computed before the item is written to, so a failing
+        processor or derived field callback never leaves a partially
+        populated item.
         """
         adapter = ItemAdapter(self.item)
+        memo: dict[str, Any] = {}
+        # Validate the whole derived field dependency graph before running any
+        # processor, so cycles and unknown dependencies fail with their path.
+        # Declaration order keeps the reported dependency path deterministic.
+        self._validate_derived_graph(tuple(self._derived_fields()))
+        # Collected fields first, in their insertion order, so the write order
+        # of non-derived fields is unchanged. Resolving them also primes the
+        # memo for any derived field that depends on collected values. A
+        # derived field name can never reach ``_values``: collecting one is
+        # rejected up front by ``_check_not_derived``.
+        computed: dict[str, Any] = {}
         for field_name in tuple(self._values):
-            value = self.get_output_value(field_name)
+            computed[field_name] = self._resolve_output_value(field_name, memo)
+        # Derived fields are resolved in declaration order; dependencies are
+        # pulled from the memo when a shared dependency (a diamond) was already
+        # evaluated, so every field output is computed at most once.
+        for field_name in self._derived_fields():
+            computed[field_name] = self._resolve_output_value(field_name, memo)
+        for field_name, value in computed.items():
             if value is not None:
                 adapter[field_name] = value
 
@@ -335,10 +442,57 @@ class ItemLoader:
         """
         Return the collected values parsed using the output processor, for the
         given field. This method doesn't populate or modify the item at all.
+
+        For a :attr:`derived field <derived_fields>`, only the fields it
+        depends on are computed, and the computation is not stored on the
+        item.
         """
+        memo: dict[str, Any] = {}
+        self._validate_derived_graph((field_name,))
+        return self._resolve_output_value(field_name, memo)
+
+    def _resolve_output_value(self, field_name: str, memo: dict[str, Any]) -> Any:
+        """Return the final output value of *field_name*, evaluating derived
+        fields recursively and memoizing every result within *memo*.
+        """
+        if field_name in memo:
+            return memo[field_name]
+        declaration = self._derived_fields().get(field_name)
+        if declaration is None:
+            value = self._run_output_processor(field_name)
+            memo[field_name] = value
+            return value
+        dependency_values = [
+            self._resolve_output_value(dependency, memo)
+            for dependency in declaration.dependencies
+        ]
+        callback = wrap_loader_context(declaration.callback, self.context)
+        try:
+            derived_value = callback(*dependency_values)
+        except Exception as e:
+            raise ValueError(
+                f"Error with derived field callback: field={field_name!r} "
+                f"dependencies={list(declaration.dependencies)!r} "
+                f"error='{type(e).__name__}: {e!s}'"
+            ) from e
+        value = self._process_derived_value(field_name, derived_value)
+        memo[field_name] = value
+        return value
+
+    def _process_derived_value(self, field_name: str, derived_value: Any) -> Any:
+        """Run the derived field's input processor, then its output processor,
+        mirroring what a collected value goes through.
+        """
+        collected = self._process_input_value(
+            field_name, list(arg_to_iter(derived_value))
+        )
+        return self._run_output_processor(field_name, list(arg_to_iter(collected)))
+
+    def _run_output_processor(self, field_name: str, value: Any | None = None) -> Any:
         proc = self.get_output_processor(field_name)
         proc = wrap_loader_context(proc, self.context)
-        value = self._values.get(field_name, [])
+        if value is None:
+            value = self._values.get(field_name, [])
         try:
             return proc(value)
         except Exception as e:
@@ -346,6 +500,58 @@ class ItemLoader:
                 f"Error with output processor: field={field_name!r} "
                 f"value={value!r} error='{type(e).__name__}: {e!s}'"
             ) from e
+
+    def _validate_derived_graph(self, roots: Sequence[str]) -> None:
+        """Walk the dependency graph reachable from *roots* and raise a
+        :class:`ValueError` describing the full dependency path on the first
+        cycle or unknown dependency, before any processor runs.
+
+        *roots* order is preserved so the reported path is deterministic.
+        """
+        declarations = self._derived_fields()
+        if not declarations:
+            # No derived fields: nothing can be cyclic or unknown through a
+            # dependency, and the hot path must stay allocation-free.
+            return
+        adapter = ItemAdapter(self.item)
+        # Schema-less items (e.g. plain dicts) accept any field name, so an
+        # uncollected dependency is treated as an empty one rather than an
+        # unknown one. Schema-bound items (dataclasses, Scrapy items, ...)
+        # only allow names declared by their fields.
+        known_item_fields = set(adapter.field_names())
+        open_item = not known_item_fields
+
+        def is_known(field_name: str) -> bool:
+            return (
+                open_item
+                or field_name in declarations
+                or field_name in known_item_fields
+            )
+
+        def visit(field_name: str, path: tuple[str, ...]) -> None:
+            declaration = declarations.get(field_name)
+            if declaration is None:
+                # Only names reached through a dependency can be unknown: a
+                # plain field requested directly is always a valid request,
+                # even when the loader declares no derived field at all.
+                if path and not is_known(field_name):
+                    raise ValueError(
+                        "Unknown derived field dependency: "
+                        + " -> ".join([*path, field_name])
+                    )
+                return
+            if field_name in path:
+                cycle_start = path.index(field_name)
+                cycle = [*path[cycle_start:], field_name]
+                raise ValueError(
+                    "Cyclic derived field dependency detected: " + " -> ".join(cycle)
+                )
+            current_path = (*path, field_name)
+            for dependency in declaration.dependencies:
+                visit(dependency, current_path)
+
+        for root in roots:
+            visit(root, ())
 
     def get_collected_values(self, field_name: str) -> list[Any]:
         """Return the collected values for the given field."""
